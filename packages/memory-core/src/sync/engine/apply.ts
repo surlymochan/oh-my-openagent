@@ -17,7 +17,7 @@
 // on: the landed render (inv. 5), or the old baseline when the render never landed.
 
 import { createHash, randomBytes } from "node:crypto"
-import { existsSync, mkdir, rename } from "../../fs/resilient"
+import { existsSync, lstat, mkdir, rename } from "../../fs/resilient"
 import { dirname, join } from "node:path"
 
 import { syncJournalDirectory } from "../../journal/fsync"
@@ -56,13 +56,26 @@ async function workingFiles(deps: EngineDeps, journal: SyncJournal): Promise<Ite
 
 /**
  * The working text at `path`, or undefined (reported) when this device cannot read that path at all
- * or, for a known item the walk did not list, when its path goes through a symlink.
+ * or, for a known item the walk did not list, when its path goes through a symlink or names an
+ * existing non-regular file. A refused key stays in the item store, so the next capture meets it
+ * again as a known but unlisted key: without the lstat refusal here, reading a FIFO left behind
+ * by a refused landing (#12568) blocks and the cycle hangs (#12158).
  */
 async function readCaptured(deps: EngineDeps, journal: SyncJournal, key: string, path: string, listed: boolean): Promise<string | null | undefined> {
   try {
     if (!listed && (await throughSymlink(deps.repo.root, path))) {
       await rejectItem(deps, journal, "capture", key, "symlink")
       return undefined
+    }
+    if (!listed) {
+      const leaf = await lstat(join(deps.repo.root, path)).catch((error: unknown) => {
+        if (error instanceof Error && "code" in error && error.code === "ENOENT") return null
+        throw error
+      })
+      if (leaf !== null && !leaf.isFile()) {
+        await rejectItem(deps, journal, "capture", key, "non-regular-file")
+        return undefined
+      }
     }
     return await readWorking(deps.repo.root, path)
   } catch (error) {
